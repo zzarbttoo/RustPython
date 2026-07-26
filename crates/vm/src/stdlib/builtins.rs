@@ -10,11 +10,11 @@ mod builtins {
     use crate::{
         AsObject, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
         builtins::{
-            PyByteArray, PyBytes, PyDictRef, PyStr, PyStrRef, PyTuple, PyTupleRef, PyType,
-            PyUtf8StrRef,
+            PyByteArray, PyBytes, PyComplex, PyDictRef, PyFloat, PyStr, PyStrRef, PyTuple,
+            PyTupleRef, PyType, PyUtf8StrRef,
             enumerate::PyReverseSequenceIterator,
             function::{PyCell, PyCellRef, PyFunction},
-            int::PyIntRef,
+            int::{PyInt, PyIntRef},
             iter::PyCallableIterator,
             list::{PyList, SortOptions},
         },
@@ -36,6 +36,7 @@ mod builtins {
         },
     };
     use itertools::Itertools;
+    use num_complex::Complex64;
     use num_traits::{Signed, ToPrimitive};
     use rustpython_common::wtf8::CodePoint;
 
@@ -1170,6 +1171,40 @@ mod builtins {
         start: OptionalArg<PyObjectRef>,
     }
 
+    /// Running sum that keeps a compensation term for lost low-order bits,
+    /// using the improved Kahan–Babuška (Neumaier) algorithm. This lets
+    /// `sum()` over floats stay accurate, matching CPython's fast path.
+    struct CompensatedSum {
+        hi: f64,
+        lo: f64,
+    }
+
+    impl CompensatedSum {
+        const fn new(x: f64) -> Self {
+            Self { hi: x, lo: 0.0 }
+        }
+
+        fn add(&mut self, x: f64) {
+            let t = self.hi + x;
+            if self.hi.abs() >= x.abs() {
+                self.lo += (self.hi - t) + x;
+            } else {
+                self.lo += (x - t) + self.hi;
+            }
+            self.hi = t;
+        }
+
+        fn value(&self) -> f64 {
+            // Avoid losing the sign on a negative result, and don't let adding
+            // the compensation turn an infinite/overflowed sum into a NaN.
+            if self.lo != 0.0 && self.lo.is_finite() {
+                self.hi + self.lo
+            } else {
+                self.hi
+            }
+        }
+    }
+
     #[expect(
         clippy::redundant_else,
         reason = "match_class! macro expansion arms has a `return` inside"
@@ -1193,10 +1228,78 @@ mod builtins {
             _ => (),
         });
 
-        for item in iterable.iter(vm)? {
+        let mut iter = iterable.iter(vm)?;
+        loop {
+            // Fast path: once the running sum is an exact float, keep the total
+            // in native f64 with compensated addition. `int` items are folded in
+            // too; anything else hands back to the general routine.
+            if let Some(f) = sum.downcast_ref_if_exact::<PyFloat>(vm) {
+                let mut cs = CompensatedSum::new(f.to_f64());
+                loop {
+                    let Some(item) = iter.next() else {
+                        return Ok(vm.ctx.new_float(cs.value()).into());
+                    };
+                    let item = item?;
+                    if let Some(g) = item.downcast_ref_if_exact::<PyFloat>(vm) {
+                        cs.add(g.to_f64());
+                    } else if let Some(v) = item
+                        .downcast_ref_if_exact::<PyInt>(vm)
+                        .and_then(|n| n.as_bigint().to_f64())
+                        .filter(|v| v.is_finite())
+                    {
+                        cs.add(v);
+                    } else {
+                        // Non-numeric, or an int too large for f64: fold the running
+                        // total back into an object and resume normally (this also
+                        // lets an oversized int raise OverflowError as usual).
+                        let total: PyObjectRef = vm.ctx.new_float(cs.value()).into();
+                        sum = vm._add(&total, &item)?;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // Fast path for complex: keep the real and imaginary parts as two
+            // compensated running totals. `float` and `int` items fold into the
+            // real part; anything else hands back to the general routine.
+            if let Some(c) = sum.downcast_ref_if_exact::<PyComplex>(vm) {
+                let z = c.to_complex();
+                let mut re = CompensatedSum::new(z.re);
+                let mut im = CompensatedSum::new(z.im);
+                loop {
+                    let Some(item) = iter.next() else {
+                        let value = Complex64::new(re.value(), im.value());
+                        return Ok(vm.ctx.new_complex(value).into());
+                    };
+                    let item = item?;
+                    if let Some(cx) = item.downcast_ref_if_exact::<PyComplex>(vm) {
+                        let z = cx.to_complex();
+                        re.add(z.re);
+                        im.add(z.im);
+                    } else if let Some(g) = item.downcast_ref_if_exact::<PyFloat>(vm) {
+                        re.add(g.to_f64());
+                    } else if let Some(v) = item
+                        .downcast_ref_if_exact::<PyInt>(vm)
+                        .and_then(|n| n.as_bigint().to_f64())
+                        .filter(|v| v.is_finite())
+                    {
+                        re.add(v);
+                    } else {
+                        let value = Complex64::new(re.value(), im.value());
+                        let total: PyObjectRef = vm.ctx.new_complex(value).into();
+                        sum = vm._add(&total, &item)?;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            let Some(item) = iter.next() else {
+                return Ok(sum);
+            };
             sum = vm._add(&sum, &*item?)?;
         }
-        Ok(sum)
     }
 
     #[derive(FromArgs)]
